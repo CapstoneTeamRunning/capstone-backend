@@ -18,6 +18,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field
 
+# Ultra Tuning 문항 생성 API 연결에 필요한 브릿지 모듈입니다.
+from question_generation_bridge.modal_client import ModalQuestionClient
+from question_generation_bridge.question_generation import create_question_generation_router
+
 DB_HOST = os.getenv("DB_HOST", "postgres")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "capstone")
@@ -1062,3 +1066,86 @@ def analyze_passage_directly(payload: AnalyzeRequest):
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# Ultra Tuning 문항 생성 API 연결부입니다.
+# 기존 API 로직은 그대로 두고, 새 라우터를 파일 맨 아래에서만 등록합니다.
+def fetch_latest_ocr_result_for_question_generation(document_id: int):
+    """문서 ID에 연결된 최신 OCR 결과를 문항 생성용으로 가져옵니다.
+
+    question_generation_bridge는 이 함수가 반환한 `id`와 `ocr_data`를 읽어
+    passage/code, instruction, category 정보를 Modal 입력으로 변환합니다.
+    최신 OCR 결과가 없으면 None을 반환하고, 라우터가 404 응답을 처리합니다.
+    """
+    with get_conn() as conn:
+        return conn.execute(
+            """
+            SELECT id, ocr_data
+            FROM ocr_results
+            WHERE document_id = %s AND is_latest = true
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+
+
+def insert_generated_question_from_modal(payload: dict):
+    """Modal 생성 결과를 `questions` 테이블에 최종 문항으로 저장합니다.
+
+    payload는 bridge mapper가 OCR 원본과 Modal 응답을 합쳐 만든 DB 저장용 dict입니다.
+    JSONB 컬럼인 `body_data`, `choices`, `raw_json`만 Jsonb로 감싸고,
+    `source_type`은 DB enum인 `question_source_type`으로 명시 캐스팅합니다.
+    저장 후 앱이 바로 사용할 수 있도록 새로 생성된 question id를 반환합니다.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO questions
+            (
+                ocr_result_id, question_no, type, body_data, choices, answer,
+                explanation, source_type, source_question_id, created_at,
+                exam_code, category_code, category_name, instruction, passage,
+                correct_rate, raw_json, external_code, module
+            )
+            VALUES
+            (
+                %(ocr_result_id)s, %(question_no)s, %(type)s, %(body_data)s,
+                %(choices)s, %(answer)s, %(explanation)s,
+                %(source_type)s::question_source_type, %(source_question_id)s,
+                now(), %(exam_code)s, %(category_code)s, %(category_name)s,
+                %(instruction)s, %(passage)s, %(correct_rate)s, %(raw_json)s,
+                %(external_code)s, %(module)s
+            )
+            RETURNING id
+            """,
+            {
+                **payload,
+                "body_data": Jsonb(payload["body_data"]),
+                "choices": Jsonb(payload["choices"]),
+                "raw_json": Jsonb(payload["raw_json"]),
+            },
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+# Modal 문항 생성 서버의 `/generate` API를 호출하는 클라이언트입니다.
+# 운영/시연 환경에서는 `MODAL_QUESTION_API_URL` 환경변수로 URL을 바꿀 수 있고,
+# 값이 없으면 현재 kcy021012 계정의 공개 Modal endpoint를 기본값으로 사용합니다.
+modal_question_client = ModalQuestionClient(
+    os.getenv(
+        "MODAL_QUESTION_API_URL",
+        "https://kcy021012--ultra-tuning-question-api-vllm-server-question-api.modal.run",
+    )
+)
+
+# 앱에서 호출할 `POST /documents/{document_id}/questions/generate` 라우터를 등록합니다.
+# 실제 DB 조회/저장 함수와 Modal 클라이언트를 주입해서, main.py에는 연결부만 남깁니다.
+app.include_router(
+    create_question_generation_router(
+        fetch_latest_ocr_result=fetch_latest_ocr_result_for_question_generation,
+        insert_question=insert_generated_question_from_modal,
+        modal_client=modal_question_client,
+    )
+)
