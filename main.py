@@ -920,25 +920,83 @@ def toggle_like(post_id: int, payload: LikeToggleRequest):
 
 
 @app.post("/documents/upload")
-async def upload_document(image: UploadFile = File(...)):
-    content = await image.read()
-    safe_name = image.filename or "upload.bin"
-    filename = f"{uuid.uuid4().hex}_{safe_name}"
-    file_path = UPLOAD_DIR / filename
-    file_path.write_bytes(content)
-
+async def upload_document(image: UploadFile = File(...), user_id: int | None = Query(default=None)):
     with get_conn() as conn:
-        demo_user_id = ensure_demo_user(conn)
+        owner_user_id = user_id if user_id is not None else ensure_demo_user(conn)
+        if user_id is not None:
+            user_exists = conn.execute("SELECT 1 FROM users WHERE id = %s", (owner_user_id,)).fetchone()
+            if user_exists is None:
+                raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+
+        content = await image.read()
+        safe_name = image.filename or "upload.bin"
+        filename = f"{uuid.uuid4().hex}_{safe_name}"
+        file_path = UPLOAD_DIR / filename
+        file_path.write_bytes(content)
+
         row = conn.execute(
             """
             INSERT INTO documents (user_id, title, storage_key, mime_type, file_size, status)
             VALUES (%s, %s, %s, %s, %s, 'uploaded')
             RETURNING id
             """,
-            (demo_user_id, safe_name, f"uploads/{filename}", image.content_type or "application/octet-stream", len(content)),
+            (owner_user_id, safe_name, f"uploads/{filename}", image.content_type or "application/octet-stream", len(content)),
         ).fetchone()
         conn.commit()
-    return {"document_id": row["id"], "image_url": f"/uploads/{filename}"}
+    return {"document_id": row["id"], "user_id": owner_user_id, "image_url": f"/uploads/{filename}"}
+
+
+
+
+def document_list_dto(row):
+    ocr_data = row.get("ocr_data") or {}
+    ocr_item = first_ocr_item(ocr_data)
+    category = ocr_item.get("category") if isinstance(ocr_item.get("category"), dict) else {}
+    passage = row.get("full_content") or ""
+    if not passage:
+        content = ocr_item.get("content") if isinstance(ocr_item.get("content"), dict) else {}
+        passage = str(content.get("passage") or "")
+    passage_preview = passage.strip().replace("\n", " ")[:180]
+    return {
+        "document_id": row["document_id"],
+        "ocr_result_id": row.get("ocr_result_id"),
+        "title": row.get("title") or "",
+        "status": row.get("status") or "",
+        "category_code": str(category.get("code") or ""),
+        "category_name": str(category.get("name") or "미분류"),
+        "passage_preview": passage_preview,
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else "",
+        "time_ago": time_ago_text(row.get("created_at")),
+    }
+
+
+@app.get("/documents")
+def get_documents(user_id: int = Query(default=1)):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                d.id AS document_id,
+                d.title,
+                d.status,
+                d.created_at,
+                latest_ocr.id AS ocr_result_id,
+                latest_ocr.ocr_data,
+                latest_ocr.full_content
+            FROM documents d
+            LEFT JOIN LATERAL (
+                SELECT id, ocr_data, full_content
+                FROM ocr_results o
+                WHERE o.document_id = d.id AND o.is_latest = true
+                ORDER BY o.created_at DESC
+                LIMIT 1
+            ) latest_ocr ON true
+            WHERE d.user_id = %s
+            ORDER BY d.created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [document_list_dto(row) for row in rows]
 
 
 @app.post("/documents/{document_id}/ocr")
