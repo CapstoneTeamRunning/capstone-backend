@@ -29,6 +29,7 @@ class OcrQuestionItem:
 class ModalQuestionRequest:
     code: str
     passage: str
+    type: str = ""
     difficulty: int | str = DEFAULT_DIFFICULTY
     ocr_result_id: int | str = ""
     question_no: int | str = ""
@@ -77,4 +78,3 @@ class QuestionInsertPayload:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-

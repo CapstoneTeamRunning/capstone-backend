@@ -90,12 +90,14 @@ def extract_first_ocr_item(ocr_result_row: Mapping[str, Any]) -> OcrQuestionItem
 def build_modal_request(
     ocr_item: OcrQuestionItem,
     *,
+    requested_type: str = "",
     difficulty: int | str = DEFAULT_DIFFICULTY,
     seed: int | None = None,
 ) -> dict[str, Any]:
     payload = ModalQuestionRequest(
         code=ocr_item.code,
         passage=ocr_item.source_text,
+        type=_text(requested_type),
         difficulty=difficulty,
         ocr_result_id=ocr_item.ocr_result_id,
         question_no=ocr_item.question_no,
@@ -113,11 +115,13 @@ def build_modal_request(
 def build_modal_request_from_ocr_row(
     ocr_result_row: Mapping[str, Any],
     *,
+    requested_type: str = "",
     difficulty: int | str = DEFAULT_DIFFICULTY,
     seed: int | None = None,
 ) -> dict[str, Any]:
     return build_modal_request(
         extract_first_ocr_item(ocr_result_row),
+        requested_type=requested_type,
         difficulty=difficulty,
         seed=seed,
     )
@@ -156,6 +160,8 @@ def build_question_insert_payload(
     *,
     ocr_item: OcrQuestionItem,
     modal_result: ModalQuestionResult | Mapping[str, Any],
+    requested_type: str = "",
+    requested_difficulty: int | str = DEFAULT_DIFFICULTY,
     source_question_id: int | str | None = None,
 ) -> dict[str, Any]:
     result = (
@@ -163,11 +169,19 @@ def build_question_insert_payload(
         if isinstance(modal_result, ModalQuestionResult)
         else normalize_modal_response(modal_result)
     )
-    question_type = ocr_item.category_code or _text(result.raw_response.get("type")) or "generated"
+    clean_requested_type = _text(requested_type)
+    question_type = clean_requested_type or ocr_item.category_code or "generated"
+    modal_request = build_modal_request(
+        ocr_item,
+        requested_type=clean_requested_type,
+        difficulty=requested_difficulty,
+    )
     body_data = {
         "code": ocr_item.code,
         "instruction": ocr_item.instruction,
         "passage": ocr_item.source_text,
+        "requested_type": clean_requested_type,
+        "difficulty": requested_difficulty,
         "category_code": ocr_item.category_code,
         "category_name": ocr_item.category_name,
         "generated": {
@@ -193,8 +207,12 @@ def build_question_insert_payload(
         passage=ocr_item.source_text,
         correct_rate=None,
         raw_json={
+            "requested": {
+                "type": clean_requested_type,
+                "difficulty": requested_difficulty,
+            },
             "ocr_item": ocr_item.raw_item,
-            "modal_request": build_modal_request(ocr_item),
+            "modal_request": modal_request,
             "modal_response": result.raw_response,
         },
         external_code=ocr_item.code,
@@ -207,11 +225,14 @@ def build_question_insert_payload_from_rows(
     *,
     ocr_result_row: Mapping[str, Any],
     modal_response: Mapping[str, Any],
+    requested_type: str = "",
+    requested_difficulty: int | str = DEFAULT_DIFFICULTY,
     source_question_id: int | str | None = None,
 ) -> dict[str, Any]:
     return build_question_insert_payload(
         ocr_item=extract_first_ocr_item(ocr_result_row),
         modal_result=normalize_modal_response(modal_response),
+        requested_type=requested_type,
+        requested_difficulty=requested_difficulty,
         source_question_id=source_question_id,
     )
-

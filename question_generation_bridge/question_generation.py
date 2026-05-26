@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from .modal_client import ModalClientError, ModalQuestionClient
 from .question_mapper import (
@@ -14,6 +15,7 @@ from .question_mapper import (
     extract_first_ocr_item,
     normalize_modal_response,
 )
+from .question_schemas import DEFAULT_DIFFICULTY
 
 
 class ModalGenerator(Protocol):
@@ -23,6 +25,18 @@ class ModalGenerator(Protocol):
 
 FetchLatestOcrResult = Callable[[int], Mapping[str, Any] | Awaitable[Mapping[str, Any] | None] | None]
 InsertQuestion = Callable[[dict[str, Any]], Mapping[str, Any] | int | Awaitable[Mapping[str, Any] | int]]
+
+
+class GenerateQuestionRequest(BaseModel):
+    type: str
+    difficulty: int = Field(default=DEFAULT_DIFFICULTY, ge=1, le=5)
+    difficult: int | None = Field(default=None, ge=1, le=5)
+
+    def requested_type(self) -> str:
+        return str(self.type or "").strip()
+
+    def resolved_difficulty(self) -> int:
+        return self.difficult if self.difficult is not None else self.difficulty
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -73,7 +87,7 @@ def create_question_generation_router(
     router = APIRouter(prefix="/documents", tags=["questions"])
 
     @router.post("/{document_id}/questions/generate")
-    async def generate_question_for_document(document_id: int) -> dict[str, Any]:
+    async def generate_question_for_document(document_id: int, request: GenerateQuestionRequest) -> dict[str, Any]:
         ocr_result_row = await _maybe_await(fetch_latest_ocr_result(document_id))
         if not ocr_result_row:
             raise HTTPException(
@@ -83,12 +97,22 @@ def create_question_generation_router(
 
         try:
             ocr_item = extract_first_ocr_item(ocr_result_row)
-            modal_request = build_modal_request(ocr_item)
+            requested_type = request.requested_type()
+            if not requested_type:
+                raise QuestionMappingError("type must not be empty")
+            requested_difficulty = request.resolved_difficulty()
+            modal_request = build_modal_request(
+                ocr_item,
+                requested_type=requested_type,
+                difficulty=requested_difficulty,
+            )
             modal_response = await _maybe_await(modal_client.generate(modal_request))
             modal_result = normalize_modal_response(modal_response)
             insert_payload = build_question_insert_payload(
                 ocr_item=ocr_item,
                 modal_result=modal_result,
+                requested_type=requested_type,
+                requested_difficulty=requested_difficulty,
             )
         except QuestionMappingError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -99,4 +123,3 @@ def create_question_generation_router(
         return _render_response(insert_payload=insert_payload, inserted=inserted)
 
     return router
-
